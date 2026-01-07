@@ -2,15 +2,21 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 import NotesList from "./components/NotesList";
 import NoteEditor from "./components/NoteEditor";
+import ConfirmDialog from "./components/ConfirmDialog";
+import ToastCenter, { useToasts } from "./components/ToastCenter";
 import { createNote, deleteNote, listNotes, updateNote } from "./api/notesApi";
 
 function findSelected(notes, selectedId) {
   return notes.find((n) => n.id === selectedId) || null;
 }
 
+function confirmLoseChanges() {
+  return window.confirm("You have unsaved changes. Discard them?");
+}
+
 // PUBLIC_INTERFACE
 function App() {
-  /** Notes frontend app: list notes, create/edit/delete, with a modern light theme. */
+  /** Notes frontend app: list notes, create/edit/delete, with a modern light theme and polished UX states. */
   const [theme, setTheme] = useState("light");
 
   const [notes, setNotes] = useState([]);
@@ -27,6 +33,16 @@ function App() {
 
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [saveSuccess, setSaveSuccess] = useState("");
+
+  const [isDirty, setIsDirty] = useState(false);
+
+  const [confirmState, setConfirmState] = useState({
+    open: false,
+    note: null,
+  });
+
+  const { toasts, success, error, dismiss } = useToasts();
 
   const selectedNote = useMemo(
     () => findSelected(notes, selectedId),
@@ -37,17 +53,28 @@ function App() {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
+  // Warn on browser tab close / refresh if there are unsaved changes.
+  useEffect(() => {
+    const handler = (e) => {
+      if (!isDirty) return;
+      e.preventDefault();
+      // Chrome requires returnValue to be set.
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isDirty]);
+
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === "light" ? "dark" : "light"));
   }, []);
 
   const refresh = useCallback(async () => {
-    const controller = new AbortController();
     setIsLoading(true);
     setLoadError("");
 
     try {
-      const data = await listNotes({ signal: controller.signal });
+      const data = await listNotes();
       setNotes(data);
 
       // Keep a sensible selection:
@@ -66,50 +93,71 @@ function App() {
         return prevMode === "create" ? "view" : prevMode;
       });
     } catch (e) {
-      setLoadError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setLoadError(message);
+      error("Couldn’t load notes", message, {
+        action: { label: "Retry", onClick: () => refresh() },
+      });
     } finally {
       setIsLoading(false);
     }
-
-    return () => controller.abort();
-  }, []);
+  }, [error]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  const handleSelect = useCallback((id) => {
-    setSelectedId(id);
-    setMode("view");
-    setSaveError("");
-  }, []);
+  const handleSelect = useCallback(
+    (id) => {
+      if ((mode === "edit" || mode === "create") && isDirty) {
+        if (!confirmLoseChanges()) return;
+      }
+      setSelectedId(id);
+      setMode("view");
+      setSaveError("");
+      setSaveSuccess("");
+    },
+    [isDirty, mode]
+  );
 
   const handleCreateNew = useCallback(() => {
+    if ((mode === "edit" || mode === "create") && isDirty) {
+      if (!confirmLoseChanges()) return;
+    }
     setSelectedId(null);
     setMode("create");
     setSaveError("");
-  }, []);
+    setSaveSuccess("");
+  }, [isDirty, mode]);
 
   const handleStartEdit = useCallback(() => {
     if (!selectedNote) return;
     setMode("edit");
     setSaveError("");
+    setSaveSuccess("");
   }, [selectedNote]);
 
   const handleCancel = useCallback(() => {
+    if ((mode === "edit" || mode === "create") && isDirty) {
+      const ok = confirmLoseChanges();
+      if (!ok) return;
+    }
+
     setSaveError("");
+    setSaveSuccess("");
     if (notes.length === 0) {
       setMode("create");
       setSelectedId(null);
       return;
     }
     setMode("view");
-  }, [notes.length]);
+  }, [isDirty, mode, notes.length]);
 
   const handleSave = useCallback(
     async ({ title, content }) => {
       setIsSaving(true);
       setSaveError("");
+      setSaveSuccess("");
 
       try {
         if (mode === "create") {
@@ -122,6 +170,10 @@ function App() {
           await refresh();
           setSelectedId(created.id);
           setMode("view");
+
+          success("Saved", "Your note was created.");
+          setSaveSuccess("Saved");
+          window.setTimeout(() => setSaveSuccess(""), 1200);
         } else if (mode === "edit" && selectedNote) {
           await updateNote(selectedNote.id, {
             title: title.trim(),
@@ -130,38 +182,56 @@ function App() {
 
           await refresh();
           setMode("view");
+
+          success("Saved", "Changes were saved.");
+          setSaveSuccess("Saved");
+          window.setTimeout(() => setSaveSuccess(""), 1200);
         }
       } catch (e) {
-        setSaveError(e instanceof Error ? e.message : String(e));
+        const message = e instanceof Error ? e.message : String(e);
+        setSaveError(message);
+        error("Save failed", message, {
+          action: { label: "Retry", onClick: () => handleSave({ title, content }) },
+        });
       } finally {
         setIsSaving(false);
       }
     },
-    [mode, refresh, selectedNote]
+    [error, mode, refresh, selectedNote, success]
   );
 
-  const handleDelete = useCallback(
-    async (note) => {
-      const ok = window.confirm(`Delete “${note.title || "Untitled"}”?`);
-      if (!ok) return;
+  const requestDelete = useCallback((note) => {
+    setConfirmState({ open: true, note });
+  }, []);
 
-      setIsSaving(true);
-      setSaveError("");
+  const confirmDelete = useCallback(async () => {
+    if (!confirmState.note) return;
 
-      try {
-        await deleteNote(note.id);
-        await refresh();
+    setIsSaving(true);
+    setSaveError("");
+    setSaveSuccess("");
 
-        // If we deleted the selected note, adjust mode/selection based on refresh() logic.
-        setMode((prevMode) => (prevMode === "edit" ? "view" : prevMode));
-      } catch (e) {
-        setSaveError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setIsSaving(false);
-      }
-    },
-    [refresh]
-  );
+    try {
+      await deleteNote(confirmState.note.id);
+      setConfirmState({ open: false, note: null });
+
+      await refresh();
+      setMode((prevMode) => (prevMode === "edit" ? "view" : prevMode));
+
+      success("Deleted", "Note removed.");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setSaveError(message);
+      error("Delete failed", message, {
+        action: {
+          label: "Retry",
+          onClick: () => confirmDelete(),
+        },
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  }, [confirmDelete, confirmState.note, error, refresh, success]);
 
   const editorNote =
     mode === "create"
@@ -170,6 +240,22 @@ function App() {
 
   return (
     <div className="App">
+      <ToastCenter toasts={toasts} onDismiss={dismiss} />
+
+      <ConfirmDialog
+        open={confirmState.open}
+        title="Delete note?"
+        description={`This will permanently delete “${
+          confirmState.note?.title || "Untitled"
+        }”.`}
+        confirmText="Delete"
+        cancelText="Cancel"
+        tone="danger"
+        isBusy={isSaving}
+        onCancel={() => setConfirmState({ open: false, note: null })}
+        onConfirm={confirmDelete}
+      />
+
       <div className="topbar">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
@@ -177,7 +263,9 @@ function App() {
           </div>
           <div className="brand-text">
             <div className="brand-title">Simple Notes</div>
-            <div className="brand-subtitle">Create, edit, and organize your notes</div>
+            <div className="brand-subtitle">
+              Create, edit, and organize your notes
+            </div>
           </div>
         </div>
 
@@ -197,9 +285,10 @@ function App() {
           selectedId={selectedId}
           isLoading={isLoading}
           error={loadError}
+          onRetryLoad={refresh}
           onSelect={handleSelect}
           onCreateNew={handleCreateNew}
-          onDelete={handleDelete}
+          onDelete={requestDelete}
         />
 
         <div className="editor-wrap">
@@ -208,6 +297,8 @@ function App() {
             mode={mode}
             isSaving={isSaving}
             error={saveError}
+            successMessage={saveSuccess}
+            onDirtyChange={setIsDirty}
             onStartEdit={handleStartEdit}
             onCancel={handleCancel}
             onSave={handleSave}
